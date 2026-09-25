@@ -1,6 +1,6 @@
 # 临床试验随机分配与盲法服务
 
-仅使用 Python 3.11+ 标准库的独立随机化服务。支持分层区组随机、试验方案锁定、隐藏分组、外部编号并发幂等、中心隔离、双人揭盲和审计。
+仅使用 Python 3.11+ 标准库的独立随机化服务。支持分层区组随机、试验方案锁定、隐藏分组、外部编号并发幂等、中心隔离、中心级启停、双人揭盲和审计。
 
 ## 运行
 
@@ -22,7 +22,10 @@ python3 -m unittest -v
 - `POST /api/trials`：创建草稿试验，指定分组、分层因素、区组长度和随机种子。
 - `POST /api/trials/{id}/protocol`：入组前修改方案；一旦入组即锁定。
 - `POST /api/trials/{id}/start`：开始入组。
-- `POST /api/trials/{id}/enroll`：按当前用户中心入组；响应只返回分配编号，不返回分组。
+- `POST /api/trials/{id}/enroll`：按当前用户中心入组；响应只返回分配编号，不返回分组。中心被暂停时拒绝新入组，已有受试者的幂等重放不受影响。
+- `POST /api/trials/{id}/sites/{site}/suspend`：协调员填写原因暂停指定中心；已有受试者与紧急揭盲照常办理。
+- `POST /api/trials/{id}/sites/{site}/resume`：恢复中心入组，从原分层下一编号继续，已占用随机号不重排。
+- `GET /api/trials/{id}/sites`：协调员/监查员查看各中心状态、暂停原因和启停记录，不含分组信息。
 - `GET /api/trials/{id}/participants`：分中心返回数据，中心用户看不到其他中心。
 - `POST /api/participants/{id}/unblinding-requests`：发起揭盲。
 - `POST /api/unblinding-requests/{id}/approve`：两人独立审批；同一人不能审批两次。

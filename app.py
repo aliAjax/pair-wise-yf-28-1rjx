@@ -10,7 +10,7 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "randomization.db"
@@ -89,6 +89,22 @@ class RandomizationStore:
                     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
                     first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
                     decided_at TEXT, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS trial_sites(
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+                    reason TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL,
+                    PRIMARY KEY(trial_id,site_id)
+                );
+                CREATE TABLE IF NOT EXISTS site_status_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('suspend','resume')),
+                    reason TEXT NOT NULL DEFAULT '',
+                    actor_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, trial_id INTEGER REFERENCES trials(id),
@@ -201,6 +217,86 @@ class RandomizationStore:
             self._audit(conn, trial_id, user_id, "trial.start", {})
             return {"id": trial_id, "status": "running"}
 
+    def _set_site_status(self, user_id, trial_id, site_id, action, reason):
+        site_id = str(site_id).strip()
+        reason = str(reason or "").strip()
+        if not site_id:
+            raise BusinessError("中心编号不能为空", 422, "invalid_site")
+        if action == "suspend" and len(reason) < 4:
+            raise BusinessError("暂停原因至少 4 字", 422, "reason_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                self._trial(conn, trial_id)
+                known = {r[0] for r in conn.execute("SELECT site_id FROM users WHERE role='site'").fetchall()}
+                known |= {r[0] for r in conn.execute("SELECT DISTINCT site_id FROM participants WHERE trial_id=?", (trial_id,)).fetchall()}
+                if site_id not in known:
+                    raise BusinessError("中心不存在", 404, "unknown_site")
+                row = conn.execute(
+                    "SELECT * FROM trial_sites WHERE trial_id=? AND site_id=?", (trial_id, site_id)
+                ).fetchone()
+                current = row["status"] if row else "active"
+                if action == "suspend":
+                    if current == "suspended":
+                        raise BusinessError("该中心已处于暂停状态", 409, "invalid_status")
+                    new_status, kept_reason = "suspended", reason
+                else:
+                    if current != "suspended":
+                        raise BusinessError("该中心未处于暂停状态", 409, "invalid_status")
+                    new_status, kept_reason = "active", ""
+                conn.execute(
+                    """INSERT INTO trial_sites(trial_id,site_id,status,reason,updated_by,updated_at) VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(trial_id,site_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,
+                       updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+                    (trial_id, site_id, new_status, kept_reason, user_id, now()),
+                )
+                conn.execute(
+                    "INSERT INTO site_status_events(trial_id,site_id,action,reason,actor_id,created_at) VALUES(?,?,?,?,?,?)",
+                    (trial_id, site_id, action, reason, user_id, now()),
+                )
+                self._audit(conn, trial_id, user_id, f"site.{action}", {"site_id": site_id, "reason": reason})
+                return {"trial_id": trial_id, "site_id": site_id, "status": new_status, "reason": kept_reason}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def suspend_site(self, user_id, trial_id, site_id, reason):
+        return self._set_site_status(user_id, trial_id, site_id, "suspend", reason)
+
+    def resume_site(self, user_id, trial_id, site_id, note=""):
+        return self._set_site_status(user_id, trial_id, site_id, "resume", note)
+
+    def list_site_statuses(self, user_id, trial_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            site_ids = [r[0] for r in conn.execute(
+                """SELECT site_id FROM users WHERE role='site'
+                   UNION SELECT DISTINCT site_id FROM participants WHERE trial_id=?
+                   UNION SELECT site_id FROM trial_sites WHERE trial_id=? ORDER BY 1""",
+                (trial_id, trial_id),
+            ).fetchall()]
+            states = {r["site_id"]: r for r in conn.execute("SELECT * FROM trial_sites WHERE trial_id=?", (trial_id,)).fetchall()}
+            enrolled = {r["site_id"]: r["count"] for r in conn.execute(
+                "SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=? GROUP BY site_id", (trial_id,)
+            ).fetchall()}
+            sites = [
+                {
+                    "site_id": sid,
+                    "status": states[sid]["status"] if sid in states else "active",
+                    "reason": states[sid]["reason"] if sid in states else "",
+                    "updated_by": states[sid]["updated_by"] if sid in states else None,
+                    "updated_at": states[sid]["updated_at"] if sid in states else None,
+                    "enrolled": enrolled.get(sid, 0),
+                }
+                for sid in site_ids
+            ]
+            events = conn.execute(
+                "SELECT * FROM site_status_events WHERE trial_id=? ORDER BY id", (trial_id,)
+            ).fetchall()
+            return {"trial_id": trial_id, "sites": sites, "events": [dict(e) for e in events]}
+
     def _stratum(self, conn, trial, factors, site_id):
         expected = json.loads(trial["strata_factors_json"])
         if set(factors) != set(expected):
@@ -265,6 +361,11 @@ class RandomizationStore:
                         raise BusinessError("不能在当前中心查看其他中心的受试者", 403, "site_isolation")
                     conn.commit()
                     return self._blinded_participant(conn, existing, actor, allow_arm=False, idempotent=True)
+                site_state = conn.execute(
+                    "SELECT status FROM trial_sites WHERE trial_id=? AND site_id=?", (trial_id, actor["site_id"])
+                ).fetchone()
+                if site_state and site_state["status"] == "suspended":
+                    raise BusinessError("本中心已暂停新受试者入组，请联系项目协调员", 409, "site_suspended")
                 stratum = self._stratum(conn, trial, factors, actor["site_id"])
                 allocation = self._next_allocation(conn, trial, stratum)
                 allocation_code = hashlib.sha256(f"{trial_id}:{external_id}".encode()).hexdigest()[:12].upper()
@@ -426,6 +527,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="sites" and method=="GET": return self._send(200, store.list_site_statuses(user,trial_id))
+            if len(parts)==6 and parts[3]=="sites" and parts[5]=="suspend" and method=="POST":
+                d=self._body(); return self._send(200, store.suspend_site(user,trial_id,unquote(parts[4]),d.get("reason","")))
+            if len(parts)==6 and parts[3]=="sites" and parts[5]=="resume" and method=="POST":
+                d=self._body(); return self._send(200, store.resume_site(user,trial_id,unquote(parts[4]),d.get("reason","")))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))

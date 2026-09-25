@@ -1,4 +1,17 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button,input{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #bbb;padding:6px 10px;text-align:left}.stopped{color:#b00;font-weight:600}</style></head>
+<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div>
+<div class="panel"><h2>中心启停（协调员）</h2><input id="site" placeholder="中心编号 如 S001"><input id="reason" placeholder="暂停原因（恢复时可填备注）" size="40"><button onclick="setSite('suspend')">暂停中心</button><button onclick="setSite('resume')">恢复中心</button><button onclick="loadSites()">刷新中心状态</button><div id="sites"></div></div>
+<pre id="out"></pre>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}
+async function loadSites(){const r=await fetch(`/api/trials/${trial.value}/sites`,{headers:{"X-User-Id":user.value}});const d=await r.json();
+if(!r.ok){sites.innerHTML=`<p>${esc(d.error?.message||r.status)}</p>`;return}
+let h="<table><tr><th>中心</th><th>状态</th><th>暂停原因</th><th>已入组</th><th>操作人</th><th>更新时间</th></tr>";
+for(const s of d.sites)h+=`<tr><td>${esc(s.site_id)}</td><td class="${s.status==="suspended"?"stopped":""}">${s.status==="suspended"?"已暂停":"入组中"}</td><td>${esc(s.reason)}</td><td>${s.enrolled}</td><td>${esc(s.updated_by||"")}</td><td>${esc(s.updated_at||"")}</td></tr>`;
+h+="</table><h3>启停记录</h3>";
+h+=d.events.length?d.events.map(e=>`<div>${esc(e.created_at)}　${esc(e.actor_id)}　${e.action==="suspend"?"暂停":"恢复"}　${esc(e.site_id)}　${esc(e.reason)}</div>`).join(""):"<div>暂无记录</div>";
+sites.innerHTML=h}
+async function setSite(action){const r=await fetch(`/api/trials/${trial.value}/sites/${encodeURIComponent(site.value)}/${action}`,{method:"POST",headers:{"X-User-Id":user.value,"Content-Type":"application/json"},body:JSON.stringify({reason:reason.value})});out.textContent=JSON.stringify(await r.json(),null,2);if(r.ok)loadSites()}
+</script></body></html>
